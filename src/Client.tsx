@@ -51,6 +51,9 @@ interface SignalingMessage {
     | 'answer'
     | 'candidate'
     | 'master_online'
+    | 'registered_ack'
+    | 'id_reassigned'
+    | 'SIGMA_REQUEST_OFFER'
     | 'SIGMA_REQUEST_AUDIO_STREAM'
     | 'SET_GAIN'
     | 'SET_MUTE'
@@ -62,6 +65,10 @@ interface SignalingMessage {
   senderId?: string;
   targetId?: string;
   target?: string;
+  offerId?: string;
+  oldId?: string;
+  newId?: string;
+  masterOnline?: boolean;
   data?: unknown;
   sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
@@ -101,7 +108,7 @@ export const RTC_CONFIG: RTCConfiguration = {
   iceCandidatePoolSize: 8,
 };
 
-const DEFAULT_MASTER_SLOTS = ['sigma-master-main', 'sigma-master-slot-1'];
+const DEFAULT_MASTER_SLOTS = ['sigma-master-main'];
 
 function getSignalingWebSocketUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -204,6 +211,13 @@ export const Client: React.FC<ClientProps> = ({
     status: 'WAITING_GPS',
     lastSent: null,
   });
+
+  // Token unik per tab/perangkat untuk mencegah 2 klien bertabrakan ID di server
+  const instanceIdRef = useRef<string>(
+    `inst-${Math.random().toString(36).slice(2, 9)}-${Date.now()}`
+  );
+  const currentOfferIdRef = useRef<string>('');
+  const lastOfferSentAtRef = useRef<number>(0);
 
   // Referensi WebSocket, Native RTCPeerConnection, DataChannel, dan Audio Stream
   const wsRef = useRef<WebSocket | null>(null);
@@ -431,7 +445,9 @@ export const Client: React.FC<ClientProps> = ({
       const pipeline = passivePipelineRef.current;
       if (pipeline) {
         if (pipeline.audioContext.state === 'suspended') {
-          await pipeline.audioContext.resume().catch(() => {});
+          // JANGAN gunakan `await` tanpa batas waktu karena Chrome/Safari dapat menahan Promise resume()
+          // selamanya sebelum ada sentuhan layar, yang akan memblokir koneksi WebSocket & PeerJS!
+          pipeline.audioContext.resume().catch(() => {});
         }
         // Terapkan state mute/gain terbaru tanpa mematikan hardware mic
         const isMuted = remoteAudioStateRef.current.muted;
@@ -519,9 +535,9 @@ export const Client: React.FC<ClientProps> = ({
 
       passivePipelineRef.current = pipeline;
 
-      // Coba aktifkan AudioContext sekarang juga
+      // Coba aktifkan AudioContext secara non-blocking agar tidak menahan proses WebRTC Offer
       if (pipeline.audioContext.state === 'suspended') {
-        await pipeline.audioContext.resume().catch(() => {});
+        pipeline.audioContext.resume().catch(() => {});
       }
 
       // Begitu AudioContext running, pastikan sender WebRTC memakai processedStream
@@ -811,6 +827,11 @@ export const Client: React.FC<ClientProps> = ({
         } catch {}
       }
 
+      const offerId = `offer-${nodeIdRef.current}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 6)}`;
+      currentOfferIdRef.current = offerId;
+
       const peerConnection = new RTCPeerConnection(RTC_CONFIG);
       nativePcRef.current = peerConnection;
       pendingCandidatesRef.current = [];
@@ -859,6 +880,7 @@ export const Client: React.FC<ClientProps> = ({
                 type: 'candidate',
                 senderId: nodeIdRef.current,
                 targetId: 'MASTER',
+                offerId,
                 data: event.candidate.toJSON(),
               })
             );
@@ -867,6 +889,7 @@ export const Client: React.FC<ClientProps> = ({
       };
 
       const checkConnectionState = () => {
+        if (nativePcRef.current !== peerConnection) return;
         const state = peerConnection.connectionState;
         const iceState = peerConnection.iceConnectionState;
 
@@ -880,11 +903,10 @@ export const Client: React.FC<ClientProps> = ({
           setPeerStatus('CONNECTED');
           transmitTelemetryPacket();
         } else if (
-          state === 'disconnected' ||
           state === 'failed' ||
           state === 'closed' ||
           iceState === 'failed' ||
-          iceState === 'disconnected'
+          iceState === 'closed'
         ) {
           const hasOpenPeerJs = Array.from(dataConnsRef.current.values()).some(
             (c) => c.open
@@ -911,6 +933,7 @@ export const Client: React.FC<ClientProps> = ({
       try {
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
+        lastOfferSentAtRef.current = Date.now();
 
         if (ws.readyState === WebSocket.OPEN && peerConnection.localDescription) {
           ws.send(
@@ -918,6 +941,7 @@ export const Client: React.FC<ClientProps> = ({
               type: 'offer',
               senderId: nodeIdRef.current,
               targetId: 'MASTER',
+              offerId: currentOfferIdRef.current,
               data: {
                 type: peerConnection.localDescription.type,
                 sdp: peerConnection.localDescription.sdp,
@@ -930,65 +954,79 @@ export const Client: React.FC<ClientProps> = ({
     []
   );
 
-  const startWebRTC = useCallback(async () => {
-    const existingPc = nativePcRef.current;
-    const hasAudioSenderTrack = Boolean(
-      existingPc &&
-        existingPc
-          .getSenders()
-          .some(
-            (s) =>
-              s.track &&
-              s.track.kind === 'audio' &&
-              s.track.readyState === 'live'
-          )
-    );
+  const startWebRTC = useCallback(
+    async (forceReset = false) => {
+      const existingPc = nativePcRef.current;
+      const hasAudioSenderTrack = Boolean(
+        existingPc &&
+          existingPc
+            .getSenders()
+            .some(
+              (s) =>
+                s.track &&
+                s.track.kind === 'audio' &&
+                s.track.readyState === 'live'
+            )
+      );
 
-    if (
-      existingPc &&
-      hasAudioSenderTrack &&
-      (existingPc.connectionState === 'connected' ||
-        existingPc.iceConnectionState === 'connected' ||
-        existingPc.iceConnectionState === 'completed')
-    ) {
-      isConnectedRef.current = true;
-      setPeerStatus('CONNECTED');
-      return;
-    }
-
-    if (isHandshakingRef.current) return;
-    isHandshakingRef.current = true;
-
-    try {
-      const stream =
-        (await ensureMicrophoneStream()) ||
-        outboundStreamRef.current ||
-        rawStreamRef.current;
-      const pc = createSamsungSafePeerConnection(stream);
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        await sendOfferOverWebSocket(pc, ws);
+      if (
+        !forceReset &&
+        existingPc &&
+        hasAudioSenderTrack &&
+        (existingPc.connectionState === 'connected' ||
+          existingPc.iceConnectionState === 'connected' ||
+          existingPc.iceConnectionState === 'completed')
+      ) {
+        isConnectedRef.current = true;
+        setPeerStatus('CONNECTED');
+        return;
       }
-    } catch {} finally {
-      setTimeout(() => {
-        isHandshakingRef.current = false;
-      }, 1200);
-    }
-  }, [
-    createSamsungSafePeerConnection,
-    ensureMicrophoneStream,
-    sendOfferOverWebSocket,
-  ]);
 
-  // Bootstrap Mikrofon + Vocal Isolation Terlebih Dahulu, Lalu WebSocket
+      // Jangan merusak handshake yang baru saja dikirim (< 8 detik) kecuali diminta paksa (forceReset)
+      const isCurrentlyNegotiating = Boolean(
+        existingPc &&
+          existingPc.signalingState !== 'closed' &&
+          existingPc.iceConnectionState !== 'failed' &&
+          existingPc.connectionState !== 'failed' &&
+          Date.now() - lastOfferSentAtRef.current < 8000
+      );
+      if (!forceReset && (isHandshakingRef.current || isCurrentlyNegotiating)) {
+        return;
+      }
+
+      isHandshakingRef.current = true;
+
+      try {
+        const stream =
+          (await ensureMicrophoneStream()) ||
+          outboundStreamRef.current ||
+          rawStreamRef.current;
+        const pc = createSamsungSafePeerConnection(stream);
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          await sendOfferOverWebSocket(pc, ws);
+        }
+      } catch {} finally {
+        setTimeout(() => {
+          isHandshakingRef.current = false;
+        }, 1200);
+      }
+    },
+    [
+      createSamsungSafePeerConnection,
+      ensureMicrophoneStream,
+      sendOfferOverWebSocket,
+    ]
+  );
+
+  // Bootstrap WebSocket Signaling + Mikrofon secara Non-Blocking agar Multi-Client Tidak Pernah Tertahan
   useEffect(() => {
     let isMounted = true;
     let wsReconnectTimer: number | null = null;
     let autoOfferInterval: number | null = null;
-    let wsFailCount = 0;
 
     const connectSignalingWebSocket = () => {
-      if (!isMounted || wsFailCount >= 3) return;
+      if (!isMounted) return;
 
       if (
         wsRef.current &&
@@ -1004,28 +1042,21 @@ export const Client: React.FC<ClientProps> = ({
 
         ws.onopen = async () => {
           if (!isMounted) return;
-          wsFailCount = 0;
           setPeerStatus((prev) =>
             prev === 'CONNECTED' ? 'CONNECTED' : 'AUTO_DISCOVERY'
           );
 
+          // Daftar ke server dengan instanceId unik agar bila ada tab/HP lain yang memakai ID sama,
+          // server otomatis memberikan ID 4-digit baru tanpa menendang klien pertama!
           ws.send(
             JSON.stringify({
               type: 'register',
-              id: nodeId,
+              id: nodeIdRef.current,
+              instanceId: instanceIdRef.current,
             })
           );
 
-          let pc = nativePcRef.current;
-          if (!pc || pc.signalingState === 'closed') {
-            const stream =
-              (await ensureMicrophoneStream()) ||
-              outboundStreamRef.current ||
-              rawStreamRef.current;
-            pc = createSamsungSafePeerConnection(stream);
-          }
-
-          await sendOfferOverWebSocket(pc, ws);
+          await startWebRTC(false);
         };
 
         ws.onmessage = async (event) => {
@@ -1038,21 +1069,43 @@ export const Client: React.FC<ClientProps> = ({
           }
           if (!data || !data.type) return;
 
-          if (data.targetId && data.targetId !== nodeId) {
+          // Jika server mendeteksi tab/HP lain sudah memakai ID ini, pindah ke ID 4-digit baru yang unik
+          if (data.type === 'id_reassigned' && data.newId) {
+            const assignedId = String(data.newId).replace('sigma-node-', '').trim();
+            if (assignedId && /^\d{4}$/.test(assignedId)) {
+              nodeIdRef.current = assignedId;
+              try {
+                sessionStorage.setItem('sigma_node_4digit_id', assignedId);
+              } catch {}
+              setNodeId(assignedId);
+            }
             return;
           }
 
-          if (data.type === 'master_online') {
+          if (data.targetId && data.targetId !== nodeIdRef.current) {
+            return;
+          }
+
+          if (data.type === 'SIGMA_REQUEST_OFFER') {
+            await startWebRTC(true);
+            return;
+          }
+
+          if (data.type === 'master_online' || data.type === 'registered_ack') {
+            if (data.type === 'registered_ack' && data.masterOnline === false) {
+              return;
+            }
             const pc = nativePcRef.current;
-            const alreadyActive =
+            const alreadyActiveOrNegotiating = Boolean(
               pc &&
-              (pc.connectionState === 'connected' ||
-                pc.iceConnectionState === 'connected' ||
-                pc.iceConnectionState === 'completed');
-            if (!alreadyActive) {
-              isConnectedRef.current = false;
-              isHandshakingRef.current = false;
-              startWebRTC();
+                (pc.connectionState === 'connected' ||
+                  pc.iceConnectionState === 'connected' ||
+                  pc.iceConnectionState === 'completed' ||
+                  (pc.signalingState === 'have-local-offer' &&
+                    Date.now() - lastOfferSentAtRef.current < 8000))
+            );
+            if (!alreadyActiveOrNegotiating) {
+              await startWebRTC(true);
             }
             return;
           }
@@ -1065,6 +1118,15 @@ export const Client: React.FC<ClientProps> = ({
             sdpPayload &&
             nativePcRef.current
           ) {
+            // Pastikan Answer ini milik Offer terbaru (bukan Answer usang dari sesi sebelumnya)
+            if (
+              data.offerId &&
+              currentOfferIdRef.current &&
+              data.offerId !== currentOfferIdRef.current
+            ) {
+              return;
+            }
+
             try {
               const pc = nativePcRef.current;
               if (pc.signalingState === 'have-local-offer') {
@@ -1098,6 +1160,13 @@ export const Client: React.FC<ClientProps> = ({
             candidatePayload &&
             nativePcRef.current
           ) {
+            if (
+              data.offerId &&
+              currentOfferIdRef.current &&
+              data.offerId !== currentOfferIdRef.current
+            ) {
+              return;
+            }
             try {
               const pc = nativePcRef.current;
               if (
@@ -1120,13 +1189,10 @@ export const Client: React.FC<ClientProps> = ({
 
         ws.onclose = () => {
           if (!isMounted) return;
-          wsFailCount++;
-          if (wsFailCount < 3) {
-            wsReconnectTimer = window.setTimeout(
-              connectSignalingWebSocket,
-              3000
-            );
-          }
+          wsReconnectTimer = window.setTimeout(
+            connectSignalingWebSocket,
+            2500
+          );
         };
 
         ws.onerror = () => {
@@ -1135,37 +1201,59 @@ export const Client: React.FC<ClientProps> = ({
           } catch {}
         };
       } catch {
-        wsFailCount++;
+        wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 3000);
       }
     };
 
-    const initializeSequentialFlow = async () => {
-      await ensureMicrophoneStream();
-      if (!isMounted) return;
-      setPeerStatus((prev) =>
-        prev === 'CONNECTED' ? 'CONNECTED' : 'AUTO_DISCOVERY'
+    // Hubungkan WebSocket segera & siapkan mikrofon secara paralel
+    setPeerStatus((prev) =>
+      prev === 'CONNECTED' ? 'CONNECTED' : 'AUTO_DISCOVERY'
+    );
+    connectSignalingWebSocket();
+
+    ensureMicrophoneStream().then((stream) => {
+      if (!isMounted || !stream) return;
+      syncActiveAudioTrackToAllSenders(stream);
+      const pc = nativePcRef.current;
+      const hasLiveAudioSender = Boolean(
+        pc &&
+          pc
+            .getSenders()
+            .some(
+              (s) =>
+                s.track &&
+                s.track.kind === 'audio' &&
+                s.track.readyState === 'live'
+            )
       );
-      connectSignalingWebSocket();
+      if (!hasLiveAudioSender && wsRef.current?.readyState === WebSocket.OPEN) {
+        startWebRTC(true);
+      }
+    });
 
-      autoOfferInterval = window.setInterval(() => {
-        if (!isMounted) return;
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          const pc = nativePcRef.current;
-          const isPcConnected = Boolean(
-            pc &&
-              (pc.connectionState === 'connected' ||
-                pc.iceConnectionState === 'connected' ||
-                pc.iceConnectionState === 'completed')
-          );
-          if (!isPcConnected) {
-            isHandshakingRef.current = false;
-            startWebRTC();
-          }
+    autoOfferInterval = window.setInterval(() => {
+      if (!isMounted) return;
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        const pc = nativePcRef.current;
+        const isPcConnected = Boolean(
+          pc &&
+            (pc.connectionState === 'connected' ||
+              pc.iceConnectionState === 'connected' ||
+              pc.iceConnectionState === 'completed')
+        );
+        const isPcChecking = Boolean(
+          pc &&
+            (pc.connectionState === 'connecting' ||
+              pc.iceConnectionState === 'checking') &&
+            Date.now() - lastOfferSentAtRef.current < 12000
+        );
+        if (!isPcConnected && !isPcChecking) {
+          startWebRTC(true);
         }
-      }, 5000);
-    };
-
-    initializeSequentialFlow();
+      } else {
+        connectSignalingWebSocket();
+      }
+    }, 8000);
 
     return () => {
       isMounted = false;
@@ -1189,6 +1277,7 @@ export const Client: React.FC<ClientProps> = ({
     nodeId,
     sendOfferOverWebSocket,
     startWebRTC,
+    syncActiveAudioTrackToAllSenders,
     transmitTelemetryPacket,
   ]);
 
@@ -1313,18 +1402,29 @@ export const Client: React.FC<ClientProps> = ({
       });
 
       conn.on('close', () => {
-        dataConnsRef.current.delete(conn.peer);
+        if (dataConnsRef.current.get(conn.peer) === conn) {
+          dataConnsRef.current.delete(conn.peer);
+        }
         const anyOpen = Array.from(dataConnsRef.current.values()).some(
           (c) => c.open
         );
-        if (!anyOpen && !nativePcRef.current) {
+        const nativePc = nativePcRef.current;
+        const isNativeConnected = Boolean(
+          nativePc &&
+            (nativePc.connectionState === 'connected' ||
+              nativePc.iceConnectionState === 'connected' ||
+              nativePc.iceConnectionState === 'completed')
+        );
+        if (!anyOpen && !isNativeConnected) {
           isConnectedRef.current = false;
           setPeerStatus('AUTO_DISCOVERY');
         }
       });
 
       conn.on('error', () => {
-        dataConnsRef.current.delete(conn.peer);
+        if (dataConnsRef.current.get(conn.peer) === conn) {
+          dataConnsRef.current.delete(conn.peer);
+        }
       });
     };
 
@@ -1338,6 +1438,19 @@ export const Client: React.FC<ClientProps> = ({
         return;
       }
       if (!peer.open) return;
+
+      // Jika Native WebSocket WebRTC sudah terhubung penuh, cukup kirim telemetri tanpa menduplikasi koneksi PeerJS
+      const nativePc = nativePcRef.current;
+      const isNativeConnected = Boolean(
+        nativePc &&
+          (nativePc.connectionState === 'connected' ||
+            nativePc.iceConnectionState === 'connected' ||
+            nativePc.iceConnectionState === 'completed')
+      );
+      if (isNativeConnected) {
+        transmitTelemetryPacket();
+        return;
+      }
 
       await ensureMicrophoneStream();
 
@@ -1372,6 +1485,20 @@ export const Client: React.FC<ClientProps> = ({
       autoDialPeerJsMaster();
     });
 
+    peer.on('error', (err: { type?: string }) => {
+      if (!isMounted) return;
+      // Jika ID sigma-node-XXXX sudah dipakai oleh perangkat lain di PeerJS dan belum terhubung via WebSocket,
+      // otomatis alokasikan ID 4-digit baru agar klien ke-2..ke-5 tidak gagal konek!
+      if (err?.type === 'unavailable-id' && !isConnectedRef.current) {
+        const freshId = String(Math.floor(1000 + Math.random() * 9000));
+        nodeIdRef.current = freshId;
+        try {
+          sessionStorage.setItem('sigma_node_4digit_id', freshId);
+        } catch {}
+        setNodeId(freshId);
+      }
+    });
+
     peer.on('call', async (incomingCall) => {
       const stream =
         (await ensureMicrophoneStream()) ||
@@ -1388,10 +1515,14 @@ export const Client: React.FC<ClientProps> = ({
         transmitTelemetryPacket();
 
         incomingCall.on('close', () => {
-          mediaCallsRef.current.delete(incomingCall.peer);
+          if (mediaCallsRef.current.get(incomingCall.peer) === incomingCall) {
+            mediaCallsRef.current.delete(incomingCall.peer);
+          }
         });
         incomingCall.on('error', () => {
-          mediaCallsRef.current.delete(incomingCall.peer);
+          if (mediaCallsRef.current.get(incomingCall.peer) === incomingCall) {
+            mediaCallsRef.current.delete(incomingCall.peer);
+          }
         });
       } else {
         incomingCall.answer();
@@ -1411,7 +1542,7 @@ export const Client: React.FC<ClientProps> = ({
 
     const peerRetryTimer = window.setInterval(() => {
       autoDialPeerJsMaster();
-    }, 4000);
+    }, 6000);
 
     const dataConns = dataConnsRef.current;
     const mediaCalls = mediaCallsRef.current;
@@ -1453,6 +1584,7 @@ export const Client: React.FC<ClientProps> = ({
           setBarcodeModalOpen(false);
           setTimeout(() => {
             ensureMicrophoneStream().then(() => {
+              startWebRTC(false);
               pushAudioCallToMaster(targetMasterIdRef.current, true);
             });
           }, 250);
@@ -1460,24 +1592,21 @@ export const Client: React.FC<ClientProps> = ({
         initialTab={barcodeModalTab}
         defaultNodeId={nodeId}
         masterPeerId={targetMasterId}
-        onScanNodeId={(scannedNodeId, scannedMasterId) => {
-          if (scannedNodeId && /^\d{4}$/.test(scannedNodeId)) {
-            try {
-              sessionStorage.setItem('sigma_node_4digit_id', scannedNodeId);
-            } catch {}
-            setNodeId(scannedNodeId);
-          }
+        onScanNodeId={(_scannedNodeId, scannedMasterId) => {
+          // PENTING: Jangan menimpa nodeId unik milik HP ini dengan ID dari QR Master
+          // agar beberapa HP yang men-scan QR Master yang sama tidak saling berebut ID!
           if (scannedMasterId) {
             setTargetMasterId(scannedMasterId);
           }
           setTimeout(() => {
             ensureMicrophoneStream().then(() => {
+              startWebRTC(true);
               pushAudioCallToMaster(
                 scannedMasterId || targetMasterIdRef.current,
                 true
               );
             });
-          }, 300);
+          }, 250);
         }}
       />
 
@@ -1584,6 +1713,7 @@ export const Client: React.FC<ClientProps> = ({
               type="button"
               onClick={async () => {
                 await ensureMicrophoneStream();
+                await startWebRTC(true);
                 await pushAudioCallToMaster(targetMasterId, true);
                 transmitTelemetryPacket();
               }}

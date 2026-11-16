@@ -62,6 +62,10 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
   const [activeTab, setActiveTab] = useState<'CLIENT_JOIN' | 'SHARE_APK' | 'SCANNER'>(
     initialTab
   );
+  const [autoAssignMultiId, setAutoAssignMultiId] = useState<boolean>(() => {
+    const clean = defaultNodeId?.replace('sigma-node-', '').trim();
+    return !(clean && /^\d{4}$/.test(clean));
+  });
   const [selectedNodeId, setSelectedNodeId] = useState<string>(() => {
     const clean = defaultNodeId?.replace('sigma-node-', '').trim();
     return clean && /^\d{4}$/.test(clean)
@@ -93,6 +97,9 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
       const clean = defaultNodeId?.replace('sigma-node-', '').trim();
       if (clean && /^\d{4}$/.test(clean)) {
         setSelectedNodeId(clean);
+        setAutoAssignMultiId(false);
+      } else {
+        setAutoAssignMultiId(true);
       }
     }
   }, [isOpen, initialTab, defaultNodeId]);
@@ -100,21 +107,35 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
   const baseOrigin = typeof window !== 'undefined' ? window.location.origin : '';
   const effectiveMasterId = masterPeerId || 'sigma-master-main';
 
-  const clientJoinUrl = `${baseOrigin}/?mode=node&id=${encodeURIComponent(
-    selectedNodeId
-  )}&master=${encodeURIComponent(effectiveMasterId)}`;
+  const clientJoinUrl = autoAssignMultiId
+    ? `${baseOrigin}/?mode=node&master=${encodeURIComponent(effectiveMasterId)}`
+    : `${baseOrigin}/?mode=node&id=${encodeURIComponent(
+        selectedNodeId
+      )}&master=${encodeURIComponent(effectiveMasterId)}`;
 
   const shareApkUrl =
     apkTargetRole === 'NODE_CLIENT'
-      ? `${baseOrigin}/?mode=node&id=${encodeURIComponent(
-          selectedNodeId
-        )}&install=apk&master=${encodeURIComponent(effectiveMasterId)}`
+      ? autoAssignMultiId
+        ? `${baseOrigin}/?mode=node&install=apk&master=${encodeURIComponent(
+            effectiveMasterId
+          )}`
+        : `${baseOrigin}/?mode=node&id=${encodeURIComponent(
+            selectedNodeId
+          )}&install=apk&master=${encodeURIComponent(effectiveMasterId)}`
       : `${baseOrigin}/?install=apk&master=${encodeURIComponent(effectiveMasterId)}`;
 
   const activeUrl = activeTab === 'SHARE_APK' ? shareApkUrl : clientJoinUrl;
   const linearBarcodeText =
     activeTab === 'SHARE_APK'
-      ? `SIGMA-APK-${apkTargetRole === 'NODE_CLIENT' ? selectedNodeId : 'FULL'}`
+      ? `SIGMA-APK-${
+          apkTargetRole === 'NODE_CLIENT'
+            ? autoAssignMultiId
+              ? 'MULTI'
+              : selectedNodeId
+            : 'FULL'
+        }`
+      : autoAssignMultiId
+      ? 'SIGMA-MULTI-NODE'
       : `SIGMA-NODE-${selectedNodeId}`;
 
   // Gunakan kontras tinggi (Hitam di atas Putih) agar 100% mudah dibaca oleh kamera HP / Samsung / WebAPK
@@ -156,10 +177,12 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
       }
 
       // 2. Format URL lengkap: https://.../?mode=node&id=7734&master=sigma-master-main
+      //    atau Multi-Node URL: https://.../?mode=node&master=sigma-master-main
       try {
         const parsed = new URL(text);
         const idParam = parsed.searchParams.get('id')?.replace('sigma-node-', '');
         const masterParam = parsed.searchParams.get('master') || undefined;
+        const modeParam = parsed.searchParams.get('mode')?.toLowerCase();
         if (idParam && /^\d{4}$/.test(idParam)) {
           if (onScanNodeId) {
             onScanNodeId(idParam, masterParam);
@@ -170,8 +193,8 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
             return;
           }
         }
-        if (masterParam && onScanNodeId) {
-          onScanNodeId(selectedNodeId, masterParam);
+        if ((masterParam || modeParam === 'node') && onScanNodeId) {
+          onScanNodeId('', masterParam || effectiveMasterId);
           onClose();
           return;
         }
@@ -184,7 +207,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
         onClose();
       }
     },
-    [effectiveMasterId, onClose, onScanNodeId, selectedNodeId]
+    [effectiveMasterId, onClose, onScanNodeId]
   );
 
   const stopCamera = useCallback(() => {
@@ -627,33 +650,69 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
         {activeTab !== 'SCANNER' ? (
           <div className="mt-4 space-y-4">
             {activeTab === 'CLIENT_JOIN' ? (
-              <div className="bg-[#071324] border border-cyan-500/30 rounded p-3 flex flex-wrap items-center justify-between gap-2">
-                <div className="text-[11px] text-slate-300">
-                  ID 4-DIGIT UNTUK HP CLIENT:
+              <div className="bg-[#071324] border border-cyan-500/30 rounded p-3 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-[11px] text-slate-300 font-semibold">
+                    MODE PAIRING MULTI-CLIENT (1–5 HP):
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setAutoAssignMultiId(true)}
+                      className={`px-2.5 py-1 text-[10px] font-bold rounded border cursor-pointer ${
+                        autoAssignMultiId
+                          ? 'bg-emerald-500/25 border-emerald-400 text-emerald-200'
+                          : 'bg-[#02060d] border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      MULTI-CLIENT (ID UNIK OTOMATIS)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAutoAssignMultiId(false)}
+                      className={`px-2.5 py-1 text-[10px] font-bold rounded border cursor-pointer ${
+                        !autoAssignMultiId
+                          ? 'bg-cyan-500/25 border-cyan-400 text-cyan-200'
+                          : 'bg-[#02060d] border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      ID SPESIFIK ({selectedNodeId})
+                    </button>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    maxLength={4}
-                    value={selectedNodeId}
-                    onChange={(e) => {
-                      const val = e.target.value.replace(/\D/g, '');
-                      setSelectedNodeId(val);
-                    }}
-                    placeholder="4-DIGIT"
-                    className="w-24 bg-[#02060d] border border-cyan-500/40 rounded px-2.5 py-1 text-xs font-bold text-cyan-300 text-center"
-                  />
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSelectedNodeId(String(Math.floor(1000 + Math.random() * 9000)))
-                    }
-                    className="flex items-center gap-1 px-2.5 py-1 text-[11px] bg-cyan-950/60 border border-cyan-500/40 text-cyan-200 rounded hover:border-cyan-400 cursor-pointer"
-                  >
-                    <RefreshCw className="w-3 h-3" />
-                    <span>ACAK ID</span>
-                  </button>
-                </div>
+
+                {!autoAssignMultiId && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-cyan-500/20">
+                    <div className="text-[11px] text-slate-300">
+                      ID 4-DIGIT UNTUK HP CLIENT INI:
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        maxLength={4}
+                        value={selectedNodeId}
+                        onChange={(e) => {
+                          const val = e.target.value.replace(/\D/g, '');
+                          setSelectedNodeId(val);
+                        }}
+                        placeholder="4-DIGIT"
+                        className="w-24 bg-[#02060d] border border-cyan-500/40 rounded px-2.5 py-1 text-xs font-bold text-cyan-300 text-center"
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelectedNodeId(
+                            String(Math.floor(1000 + Math.random() * 9000))
+                          )
+                        }
+                        className="flex items-center gap-1 px-2.5 py-1 text-[11px] bg-cyan-950/60 border border-cyan-500/40 text-cyan-200 rounded hover:border-cyan-400 cursor-pointer"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        <span>ACAK ID</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="bg-[#071324] border border-emerald-500/30 rounded p-3 space-y-2">
@@ -672,7 +731,8 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
                   >
                     <div className="text-xs font-bold">CLIENT TRANSMITTER APK</div>
                     <div className="text-[10px] text-slate-400 mt-0.5">
-                      HP yang scan langsung membuka &amp; menginstall mode Node ({selectedNodeId})
+                      HP yang scan langsung membuka &amp; menginstall mode Node (
+                      {autoAssignMultiId ? 'ID Unik Otomatis 1–5 HP' : selectedNodeId})
                     </div>
                   </button>
 
@@ -698,6 +758,8 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
               <div className="text-[11px] tracking-widest text-cyan-400 font-semibold uppercase">
                 {activeTab === 'SHARE_APK'
                   ? 'SCAN BARCODE UNTUK DOWNLOAD / INSTALL WEBAPK'
+                  : autoAssignMultiId
+                  ? 'SCAN DI 1–5 HP CLIENT UNTUK AUTO-JOIN KE MASTER (ID UNIK OTOMATIS)'
                   : `SCAN BARCODE DI HP CLIENT / MASTER UNTUK PAIRING NODE (${selectedNodeId})`}
               </div>
 

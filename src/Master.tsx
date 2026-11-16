@@ -43,6 +43,31 @@ export interface ClientStreamEntry {
   stream: MediaStream;
 }
 
+const TacticalClock: React.FC = () => {
+  const [clockStr, setClockStr] = useState<string>('00:00:00:00');
+
+  useEffect(() => {
+    let raf: number;
+    const tick = () => {
+      const now = new Date();
+      const hh = String(now.getHours()).padStart(2, '0');
+      const mm = String(now.getMinutes()).padStart(2, '0');
+      const ss = String(now.getSeconds()).padStart(2, '0');
+      const ms = String(Math.floor(now.getMilliseconds() / 10)).padStart(2, '0');
+      setClockStr(`${hh}:${mm}:${ss}:${ms}`);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  return (
+    <div className="bg-[#06101e] border border-cyan-400/50 rounded px-3 py-1.5 text-lg sm:text-xl font-bold tracking-wider text-cyan-200 font-mono-tactical">
+      {clockStr}
+    </div>
+  );
+};
+
 const ClientAudioElement: React.FC<{
   id: string;
   stream: MediaStream;
@@ -59,10 +84,20 @@ const ClientAudioElement: React.FC<{
   onAutoplaySuccess,
 }) => {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const callbacksRef = useRef({
+    onRegisterEl,
+    onAutoplayBlocked,
+    onAutoplaySuccess,
+  });
+  callbacksRef.current = {
+    onRegisterEl,
+    onAutoplayBlocked,
+    onAutoplaySuccess,
+  };
 
   useEffect(() => {
     const el = audioRef.current;
-    onRegisterEl(id, el);
+    callbacksRef.current.onRegisterEl(id, el);
     if (!el) return;
 
     if (el.srcObject !== stream) {
@@ -73,18 +108,20 @@ const ClientAudioElement: React.FC<{
 
     const p = el.play();
     if (p !== undefined) {
-      p.then(() => onAutoplaySuccess()).catch((err: unknown) => {
-        const name = err instanceof Error ? err.name : String(err);
-        if (name === 'NotAllowedError') {
-          onAutoplayBlocked();
+      p.then(() => callbacksRef.current.onAutoplaySuccess()).catch(
+        (err: unknown) => {
+          const name = err instanceof Error ? err.name : String(err);
+          if (name === 'NotAllowedError') {
+            callbacksRef.current.onAutoplayBlocked();
+          }
         }
-      });
+      );
     }
 
     return () => {
-      onRegisterEl(id, null);
+      callbacksRef.current.onRegisterEl(id, null);
     };
-  }, [id, stream, muted, onRegisterEl, onAutoplayBlocked, onAutoplaySuccess]);
+  }, [id, stream, muted]);
 
   return (
     <audio
@@ -270,7 +307,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     hasLock: false,
   });
 
-  const [clockStr, setClockStr] = useState<string>('00:00:00:00');
   const [autoRecordMode, setAutoRecordMode] = useState<AutoRecordMode>('IMMEDIATE');
   const [voxThreshold, setVoxThreshold] = useState<number>(28);
   const [soloNodeId, setSoloNodeId] = useState<string | null>(null);
@@ -346,21 +382,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       () => {},
       { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
     );
-  }, []);
-
-  useEffect(() => {
-    let raf: number;
-    const tick = () => {
-      const now = new Date();
-      const hh = String(now.getHours()).padStart(2, '0');
-      const mm = String(now.getMinutes()).padStart(2, '0');
-      const ss = String(now.getSeconds()).padStart(2, '0');
-      const ms = String(Math.floor(now.getMilliseconds() / 10)).padStart(2, '0');
-      setClockStr(`${hh}:${mm}:${ss}:${ms}`);
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
   }, []);
 
   const getAudioContext = useCallback(() => {
@@ -639,8 +660,10 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     const hasOpenNativePc =
       nativePc &&
       (nativePc.connectionState === 'connected' ||
+        nativePc.connectionState === 'connecting' ||
         nativePc.iceConnectionState === 'connected' ||
-        nativePc.iceConnectionState === 'completed');
+        nativePc.iceConnectionState === 'completed' ||
+        nativePc.iceConnectionState === 'checking');
 
     if (hasOpenData || hasOpenMedia || hasOpenNativePc) return;
 
@@ -719,19 +742,28 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         ? existing.stream
             .getAudioTracks()
             .map((t) => t.id)
+            .sort()
             .join(',')
         : '';
       const incomingTrackSig = remoteStream
         .getAudioTracks()
         .map((t) => t.id)
+        .sort()
         .join(',');
+
+      const existingHasLiveAudio = existing
+        ? existing.stream
+            .getAudioTracks()
+            .some((t) => t.readyState === 'live')
+        : false;
 
       if (
         existing &&
-        existing.stream.id === remoteStream.id &&
+        existingHasLiveAudio &&
+        existingTrackSig &&
         existingTrackSig === incomingTrackSig
       ) {
-        // Stream dan daftar track yang sama sudah terpasang; cukup pastikan <audio> diputar
+        // Daftar audio track yang sama sudah terpasang dan aktif; cukup pastikan <audio> diputar
         unlockAllAudioPlayback();
         return;
       }
@@ -848,11 +880,13 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       const bindDataPcHandlers = () => {
         if (!conn.peerConnection) return;
 
-        const negHandler = setupNegotiation(conn.peerConnection, {
-          dataChannel: conn,
-          nodeId,
-        });
-        negotiationHandlersRef.current.set(nodeId, negHandler);
+        if (!negotiationHandlersRef.current.has(nodeId)) {
+          const negHandler = setupNegotiation(conn.peerConnection, {
+            dataChannel: conn,
+            nodeId,
+          });
+          negotiationHandlersRef.current.set(nodeId, negHandler);
+        }
 
         const pcWithFlag = conn.peerConnection as RTCPeerConnection & {
           __sigmaTrackBound?: boolean;
@@ -920,12 +954,16 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       });
 
       conn.on('close', () => {
-        dataConnsRef.current.delete(nodeId);
+        if (dataConnsRef.current.get(nodeId) === conn) {
+          dataConnsRef.current.delete(nodeId);
+        }
         removeDisconnectedClient(nodeId);
       });
 
       conn.on('error', () => {
-        dataConnsRef.current.delete(nodeId);
+        if (dataConnsRef.current.get(nodeId) === conn) {
+          dataConnsRef.current.delete(nodeId);
+        }
         removeDisconnectedClient(nodeId);
       });
     },
@@ -955,11 +993,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         };
         if (pcWithFlag.__sigmaMediaTrackBound) return;
         pcWithFlag.__sigmaMediaTrackBound = true;
-
-        setupNegotiation(pc, {
-          dataChannel: dataConnsRef.current.get(nodeId) || null,
-          nodeId,
-        });
 
         pc.addEventListener('track', (event: RTCTrackEvent) => {
           handleIncomingAudio(event, {
@@ -993,12 +1026,16 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       });
 
       call.on('close', () => {
-        mediaCallsRef.current.delete(nodeId);
+        if (mediaCallsRef.current.get(nodeId) === call) {
+          mediaCallsRef.current.delete(nodeId);
+        }
         removeDisconnectedClient(nodeId);
       });
 
       call.on('error', () => {
-        mediaCallsRef.current.delete(nodeId);
+        if (mediaCallsRef.current.get(nodeId) === call) {
+          mediaCallsRef.current.delete(nodeId);
+        }
         removeDisconnectedClient(nodeId);
       });
     },
@@ -1012,22 +1049,41 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
       unlockAllAudioPlayback();
 
+      // 1. Kirim sinyal permintaan Offer melalui WebSocket Switchboard (/ws) jika aktif
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        try {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'SIGMA_REQUEST_OFFER',
+              senderId: 'MASTER',
+              targetId: cleaned,
+            })
+          );
+          setConnectionBanner(
+            `MEMINTA KONEKSI MULTI-PEER KE NODE (${cleaned}) VIA WEBSOCKET...`
+          );
+        } catch {}
+      }
+
+      // 2. Dial juga melalui PeerJS Broker jika siap
       const peer = peerRef.current;
       if (!peer || !peer.open) {
-        setConnectionBanner('SIGNALING SERVER BELUM SIAP, COBA SESAAT LAGI...');
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+          setConnectionBanner('SIGNALING SERVER BELUM SIAP, COBA SESAAT LAGI...');
+        }
         return;
       }
 
       const targetPeerId = `sigma-node-${cleaned}`;
       setConnectionBanner(`MENGHUBUNGKAN KE NODE ${cleaned} (${targetPeerId})...`);
 
-      // 1. Open WebRTC DataChannel to Node
+      // Open WebRTC DataChannel to Node
       const conn: DataConnection = peer.connect(targetPeerId, {
         reliable: true,
       });
       registerDataConnection(cleaned, conn);
 
-      // 2. Place WebRTC Media Call to Node dengan dummy audio track nyata agar SDP memiliki m=audio
+      // Place WebRTC Media Call to Node dengan dummy audio track nyata agar SDP memiliki m=audio
       const offerStream = createMasterOfferDummyStream();
       const call: MediaConnection = peer.call(targetPeerId, offerStream);
       if (call) {
@@ -1102,13 +1158,21 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   useEffect(() => {
     let isMounted = true;
     let reconnectTimer: number | null = null;
-    let wsFailCount = 0;
+    const disconnectTimers = new Map<string, number>();
     const pcMap = peerConnections.current;
     const dcMap = nativeDataChannelsRef.current;
     const candQueueMap = pendingCandidatesRef.current;
 
+    const clearDisconnectTimer = (clientId: string) => {
+      const timer = disconnectTimers.get(clientId);
+      if (timer) {
+        clearTimeout(timer);
+        disconnectTimers.delete(clientId);
+      }
+    };
+
     const connectMasterWebSocket = () => {
-      if (!isMounted || wsFailCount >= 3) return;
+      if (!isMounted) return;
       if (
         wsRef.current &&
         (wsRef.current.readyState === WebSocket.OPEN ||
@@ -1123,7 +1187,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
         ws.onopen = () => {
           if (!isMounted) return;
-          wsFailCount = 0;
           const regPayload = {
             type: 'register',
             id: 'MASTER',
@@ -1159,9 +1222,45 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
           // A. Tangani Paket Telemetri GPS dari Klien
           if (data.type === 'SIGMA_TELEMETRY') {
+            clearDisconnectTimer(senderId);
             handlersRef.current.handleIncomingTelemetry(
               data as unknown as TelemetryPayload
             );
+            return;
+          }
+
+          // A2. Jika Klien baru bergabung di server dan belum ada koneksi aktif, minta Offer
+          if (data.type === 'NEW_CLIENT_JOINED') {
+            clearDisconnectTimer(senderId);
+            const existingPc = pcMap.get(senderId);
+            const isHealthy =
+              existingPc &&
+              (existingPc.connectionState === 'connected' ||
+                existingPc.connectionState === 'connecting' ||
+                existingPc.iceConnectionState === 'connected' ||
+                existingPc.iceConnectionState === 'completed' ||
+                existingPc.iceConnectionState === 'checking');
+            if (!isHealthy && ws.readyState === WebSocket.OPEN) {
+              setTimeout(() => {
+                if (!isMounted || ws.readyState !== WebSocket.OPEN) return;
+                const curPc = pcMap.get(senderId);
+                if (
+                  !curPc ||
+                  (curPc.connectionState !== 'connected' &&
+                    curPc.connectionState !== 'connecting' &&
+                    curPc.iceConnectionState !== 'connected' &&
+                    curPc.iceConnectionState !== 'checking')
+                ) {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'SIGMA_REQUEST_OFFER',
+                      senderId: 'MASTER',
+                      targetId: senderId,
+                    })
+                  );
+                }
+              }, 600);
+            }
             return;
           }
 
@@ -1171,6 +1270,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             data.type === 'CLIENT_DISCONNECTED'
           ) {
             console.log(`[MASTER-WS] Klien "${senderId}" terputus. Membersihkan slot.`);
+            clearDisconnectTimer(senderId);
             const oldPc = pcMap.get(senderId);
             if (oldPc) {
               try {
@@ -1192,6 +1292,10 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             (data.type === 'offer' || data.type === 'OFFER') &&
             offerPayload
           ) {
+            clearDisconnectTimer(senderId);
+            const offerId =
+              typeof data.offerId === 'string' ? data.offerId : undefined;
+
             const isExisting =
               pcMap.has(senderId) ||
               clientsRef.current.some((c) => c.nodeId === senderId);
@@ -1225,9 +1329,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             pcMap.set(senderId, pc);
             // Tandai bahwa remoteDescription belum selesai diset (cegah race condition ICE Candidate)
             remoteDescReadyRef.current.set(senderId, false);
-            if (!candQueueMap.has(senderId)) {
-              candQueueMap.set(senderId, []);
-            }
+            candQueueMap.set(senderId, []);
 
             handlersRef.current.upsertConnectedClient(senderId, {
               lastTelemetryAt: Date.now(),
@@ -1244,11 +1346,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
                   type: 'candidate',
                   senderId: 'MASTER',
                   targetId: senderId,
+                  offerId,
                   data: candidateJson,
                 };
-                console.log(
-                  `[MASTER-WS] Mengirim ICE Candidate ke targetId="${senderId}"`
-                );
                 ws.send(JSON.stringify(candidatePacket));
               }
             };
@@ -1306,7 +1406,27 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               console.log(
                 `[MASTER-WS] iceConnectionState untuk "${senderId}": ${st}`
               );
-              if (st === 'failed' || st === 'closed') {
+              if (st === 'connected' || st === 'completed') {
+                clearDisconnectTimer(senderId);
+              } else if (st === 'disconnected') {
+                clearDisconnectTimer(senderId);
+                const graceId = window.setTimeout(() => {
+                  if (!isMounted || pcMap.get(senderId) !== pc) return;
+                  if (
+                    pc.iceConnectionState === 'disconnected' ||
+                    pc.iceConnectionState === 'failed' ||
+                    pc.iceConnectionState === 'closed'
+                  ) {
+                    pcMap.delete(senderId);
+                    dcMap.delete(senderId);
+                    candQueueMap.delete(senderId);
+                    remoteDescReadyRef.current.delete(senderId);
+                    handlersRef.current.removeDisconnectedClient(senderId);
+                  }
+                }, 5000);
+                disconnectTimers.set(senderId, graceId);
+              } else if (st === 'failed' || st === 'closed') {
+                clearDisconnectTimer(senderId);
                 pcMap.delete(senderId);
                 dcMap.delete(senderId);
                 candQueueMap.delete(senderId);
@@ -1319,6 +1439,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               await pc.setRemoteDescription(
                 new RTCSessionDescription(offerPayload)
               );
+              if (pcMap.get(senderId) !== pc) return;
               // Setelah setRemoteDescription() selesai dieksekusi (resolved promise),
               // tandai siap dan masukkan semua candidate yang sempat tertahan di antrean
               remoteDescReadyRef.current.set(senderId, true);
@@ -1327,9 +1448,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               while (candidateQueue.length > 0) {
                 const nextCand = candidateQueue.shift();
                 if (nextCand) {
-                  console.log(
-                    `[MASTER-WS] Memasukkan ICE Candidate dari antrean untuk "${senderId}"`
-                  );
                   await pc
                     .addIceCandidate(new RTCIceCandidate(nextCand))
                     .catch((err) => {
@@ -1344,11 +1462,16 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               const answer = await pc.createAnswer();
               await pc.setLocalDescription(answer);
 
-              if (ws.readyState === WebSocket.OPEN && pc.localDescription) {
+              if (
+                pcMap.get(senderId) === pc &&
+                ws.readyState === WebSocket.OPEN &&
+                pc.localDescription
+              ) {
                 const answerPacket = {
                   type: 'answer',
                   senderId: 'MASTER',
                   targetId: senderId,
+                  offerId,
                   data: {
                     type: pc.localDescription.type,
                     sdp: pc.localDescription.sdp,
@@ -1384,9 +1507,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               remoteDescReadyRef.current.get(senderId) === true;
 
             if (pc && isRemoteReady) {
-              console.log(
-                `[MASTER-WS] Menambahkan ICE Candidate langsung ke peerConnections.get("${senderId}")`
-              );
               await pc
                 .addIceCandidate(new RTCIceCandidate(candidatePayload))
                 .catch((err) => {
@@ -1396,9 +1516,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
                   );
                 });
             } else {
-              console.log(
-                `[MASTER-WS] Mengantrekan ICE Candidate untuk "${senderId}" ke candidateQueue (remoteDescription belum siap)`
-              );
               const candidateQueue = candQueueMap.get(senderId) || [];
               candidateQueue.push(candidatePayload);
               candQueueMap.set(senderId, candidateQueue);
@@ -1408,10 +1525,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
         ws.onclose = () => {
           if (!isMounted) return;
-          wsFailCount++;
-          if (wsFailCount < 3) {
-            reconnectTimer = window.setTimeout(connectMasterWebSocket, 3000);
-          }
+          reconnectTimer = window.setTimeout(connectMasterWebSocket, 2500);
         };
 
         ws.onerror = () => {
@@ -1420,7 +1534,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
           } catch {}
         };
       } catch {
-        wsFailCount++;
+        reconnectTimer = window.setTimeout(connectMasterWebSocket, 3000);
       }
     };
 
@@ -1429,6 +1543,8 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     return () => {
       isMounted = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      disconnectTimers.forEach((t) => clearTimeout(t));
+      disconnectTimers.clear();
       if (wsRef.current) {
         try {
           wsRef.current.close();
@@ -1933,7 +2049,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         defaultNodeId={barcodeTargetNodeId}
         masterPeerId={masterPeerId}
         onScanNodeId={(scannedId) => {
-          connectToRemoteNode(scannedId);
+          if (scannedId) {
+            connectToRemoteNode(scannedId);
+          }
         }}
       />
 
@@ -2063,9 +2181,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             </div>
           </div>
 
-          <div className="bg-[#06101e] border border-cyan-400/50 rounded px-3 py-1.5 text-lg sm:text-xl font-bold tracking-wider text-cyan-200 font-mono-tactical">
-            {clockStr}
-          </div>
+          <TacticalClock />
 
           <PWAInstallButton />
 
