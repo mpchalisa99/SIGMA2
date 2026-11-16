@@ -135,6 +135,7 @@ const ClientAudioElement: React.FC<{
 };
 
 export type AutoRecordMode = 'OFF' | 'IMMEDIATE' | 'VOX';
+export type TacticalAudioMode = 'RAW' | 'CLEAR EQ' | 'TACTICAL BOOST';
 
 export interface ConnectedClient {
   nodeId: string; // 4-digit ID e.g. "7734"
@@ -284,8 +285,11 @@ interface AudioPipelineEntry {
   stream: MediaStream;
   processedStream: MediaStream;
   sourceNode: MediaStreamAudioSourceNode;
+  compressorNode: DynamicsCompressorNode;
+  highShelfNode: BiquadFilterNode;
   gainNode: GainNode;
   analyser: AnalyserNode;
+  destNode: MediaStreamAudioDestinationNode;
   speakerGain: GainNode;
   recorder: MediaRecorder | null;
   chunks: BlobPart[];
@@ -307,6 +311,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     hasLock: false,
   });
 
+  // 1. STATE & UI TOMBOL MODE AUDIO TAKTIS ('RAW' | 'CLEAR EQ' | 'TACTICAL BOOST')
+  const [audioMode, setAudioMode] = useState<TacticalAudioMode>('RAW');
+  const [manualGainValue, setManualGainValue] = useState<number>(1.0);
   const [autoRecordMode, setAutoRecordMode] = useState<AutoRecordMode>('IMMEDIATE');
   const [voxThreshold, setVoxThreshold] = useState<number>(28);
   const [soloNodeId, setSoloNodeId] = useState<string | null>(null);
@@ -338,6 +345,20 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const pipelinesRef = useRef<Map<string, AudioPipelineEntry>>(new Map());
+  // 2. PENYIMPANAN NODE AUDIO (USEREF) AGAR RUTE BISA DIUBAH TANPA MEMUTUS WEBRTC
+  const audioNodes = useRef<{
+    source: MediaStreamAudioSourceNode | null;
+    compressor: DynamicsCompressorNode | null;
+    highShelf: BiquadFilterNode | null;
+    gain: GainNode | null;
+    ctx: AudioContext | null;
+  }>({
+    source: null,
+    compressor: null,
+    highShelf: null,
+    gain: null,
+    ctx: null,
+  });
   const wsRef = useRef<WebSocket | null>(null);
 
   const dataConnsRef = useRef<Map<string, DataConnection>>(new Map());
@@ -353,6 +374,12 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
   const clientsRef = useRef(clients);
   clientsRef.current = clients;
+
+  const audioModeRef = useRef<TacticalAudioMode>(audioMode);
+  audioModeRef.current = audioMode;
+
+  const manualGainRef = useRef<number>(manualGainValue);
+  manualGainRef.current = manualGainValue;
 
   const autoRecordModeRef = useRef(autoRecordMode);
   autoRecordModeRef.current = autoRecordMode;
@@ -703,11 +730,35 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       }
       try {
         entry.sourceNode.disconnect();
+        entry.compressorNode.disconnect();
+        entry.highShelfNode.disconnect();
         entry.gainNode.disconnect();
         entry.analyser.disconnect();
         entry.speakerGain.disconnect();
       } catch {}
       pipelinesRef.current.delete(nodeId);
+
+      // Jika audioNodes.current menunjuk ke node yang baru saja dihapus, arahkan ke klien aktif lain (jika ada)
+      if (audioNodes.current.source === entry.sourceNode) {
+        const remaining = Array.from(pipelinesRef.current.values())[0];
+        if (remaining && audioCtxRef.current) {
+          audioNodes.current = {
+            source: remaining.sourceNode,
+            compressor: remaining.compressorNode,
+            highShelf: remaining.highShelfNode,
+            gain: remaining.gainNode,
+            ctx: audioCtxRef.current,
+          };
+        } else {
+          audioNodes.current = {
+            source: null,
+            compressor: null,
+            highShelf: null,
+            gain: null,
+            ctx: audioCtxRef.current,
+          };
+        }
+      }
     }
 
     setClients((prev) =>
@@ -721,10 +772,178 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   }, []);
 
   /**
-   * PERBAIKAN PENTING 2 & 3:
-   * Sambungkan MediaStream dari Client ke:
-   * 1. Elemen HTML `<audio autoPlay playsInline>` menggunakan `audioEl.srcObject = remoteStream`
-   * 2. Web Audio API `AudioContext` (GainNode + AnalyserNode) untuk visualizer & gain boost
+   * 3. FUNGSI DYNAMIC ROUTING (SWITCHER): `applyAudioMode(mode)`
+   * Memutus koneksi Web Audio API lama (`.disconnect()`) lalu menyambung ulang rutenya
+   * berdasarkan mode yang dipilih tanpa memutus sesi WebRTC:
+   * - 'RAW': source -> gain -> destination (Bypass efek, suara murni lingkungan)
+   * - 'CLEAR EQ': source -> compressor (ratio 8, threshold -30dB) -> highShelf (+6dB @ 4000Hz) -> gain -> destination
+   * - 'TACTICAL BOOST': source -> compressor (ratio 20, threshold -50dB) -> highShelf (+8dB @ 4000Hz) -> gain -> destination
+   */
+  const routeSinglePipelineNodes = useCallback(
+    (
+      nodes: {
+        ctx: AudioContext;
+        source: MediaStreamAudioSourceNode;
+        compressor: DynamicsCompressorNode;
+        highShelf: BiquadFilterNode;
+        gain: GainNode;
+        analyser?: AnalyserNode;
+        destNode?: MediaStreamAudioDestinationNode;
+        speakerGain?: GainNode;
+      },
+      mode: TacticalAudioMode
+    ) => {
+      const {
+        ctx,
+        source,
+        compressor,
+        highShelf,
+        gain,
+        analyser,
+        destNode,
+        speakerGain,
+      } = nodes;
+
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+
+      // Putuskan rute lama sebelum menyambung rute baru
+      try {
+        source.disconnect();
+      } catch {}
+      try {
+        compressor.disconnect();
+      } catch {}
+      try {
+        highShelf.disconnect();
+      } catch {}
+      try {
+        gain.disconnect();
+      } catch {}
+
+      const now = ctx.currentTime;
+
+      if (mode === 'RAW') {
+        // Rute: source -> gain -> destination (Bypass efek)
+        source.connect(gain);
+      } else if (mode === 'CLEAR EQ') {
+        // Rute: source -> compressor -> highShelf -> gain -> destination
+        // HighShelf +6dB di 4000Hz, Compressor ratio 8, threshold -30dB
+        compressor.threshold.setValueAtTime(-30, now);
+        compressor.knee.setValueAtTime(18, now);
+        compressor.ratio.setValueAtTime(8, now);
+        compressor.attack.setValueAtTime(0.003, now);
+        compressor.release.setValueAtTime(0.25, now);
+
+        highShelf.type = 'highshelf';
+        highShelf.frequency.setValueAtTime(4000, now);
+        highShelf.gain.setValueAtTime(6, now);
+
+        source.connect(compressor);
+        compressor.connect(highShelf);
+        highShelf.connect(gain);
+      } else if (mode === 'TACTICAL BOOST') {
+        // Rute: source -> compressor -> highShelf -> gain -> destination
+        // Compressor ekstrem: ratio 20, threshold -50dB. HighShelf +8dB @ 4000Hz
+        compressor.threshold.setValueAtTime(-50, now);
+        compressor.knee.setValueAtTime(30, now);
+        compressor.ratio.setValueAtTime(20, now);
+        compressor.attack.setValueAtTime(0.001, now);
+        compressor.release.setValueAtTime(0.2, now);
+
+        highShelf.type = 'highshelf';
+        highShelf.frequency.setValueAtTime(4000, now);
+        highShelf.gain.setValueAtTime(8, now);
+
+        source.connect(compressor);
+        compressor.connect(highShelf);
+        highShelf.connect(gain);
+      }
+
+      // Sambungkan keluaran gain ke analyser, perekam, dan destination (speaker)
+      if (analyser) {
+        gain.connect(analyser);
+      }
+      if (destNode) {
+        gain.connect(destNode);
+      }
+      if (speakerGain) {
+        gain.connect(speakerGain);
+        try {
+          speakerGain.disconnect();
+        } catch {}
+        speakerGain.connect(ctx.destination);
+      } else {
+        gain.connect(ctx.destination);
+      }
+    },
+    []
+  );
+
+  const applyAudioMode = useCallback(
+    (mode: TacticalAudioMode) => {
+      setAudioMode(mode);
+      audioModeRef.current = mode;
+
+      // 1. Terapkan dynamic routing pada instance di `audioNodes.current`
+      const current = audioNodes.current;
+      if (
+        current.ctx &&
+        current.source &&
+        current.compressor &&
+        current.highShelf &&
+        current.gain
+      ) {
+        const matchingEntry = Array.from(pipelinesRef.current.values()).find(
+          (entry) => entry.sourceNode === current.source
+        );
+        routeSinglePipelineNodes(
+          {
+            ctx: current.ctx,
+            source: current.source,
+            compressor: current.compressor,
+            highShelf: current.highShelf,
+            gain: current.gain,
+            analyser: matchingEntry?.analyser,
+            destNode: matchingEntry?.destNode,
+            speakerGain: matchingEntry?.speakerGain,
+          },
+          mode
+        );
+      }
+
+      // 2. Terapkan juga ke seluruh pipeline Klien aktif (jika > 1 Klien terhubung)
+      const ctx = audioCtxRef.current;
+      if (ctx) {
+        pipelinesRef.current.forEach((entry) => {
+          routeSinglePipelineNodes(
+            {
+              ctx,
+              source: entry.sourceNode,
+              compressor: entry.compressorNode,
+              highShelf: entry.highShelfNode,
+              gain: entry.gainNode,
+              analyser: entry.analyser,
+              destNode: entry.destNode,
+              speakerGain: entry.speakerGain,
+            },
+            mode
+          );
+        });
+      }
+
+      setConnectionBanner(
+        `AUDIO MODE SWITCHED: [${mode}] · DYNAMIC ROUTING ACTIVE`
+      );
+    },
+    [routeSinglePipelineNodes]
+  );
+
+  /**
+   * 4. INTEGRASI SAAT ONTRACK / STREAM MASUK:
+   * Inisialisasi semua Node (`source`, `compressor`, `highShelf`, `gain`, `ctx`),
+   * simpan ke `audioNodes.current` (`useRef`), dan panggil `applyAudioMode(audioMode)`
    */
   const attachWebRTCStreamToNode = useCallback(
     (nodeId: string, remoteStream: MediaStream) => {
@@ -776,17 +995,28 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         }
         try {
           existing.sourceNode.disconnect();
+          existing.compressorNode.disconnect();
+          existing.highShelfNode.disconnect();
           existing.gainNode.disconnect();
           existing.analyser.disconnect();
           existing.speakerGain.disconnect();
         } catch {}
       }
 
+      // Inisialisasi node-node Web Audio API
       const sourceNode = ctx.createMediaStreamSource(remoteStream);
+      const compressorNode = ctx.createDynamicsCompressor();
+      const highShelfNode = ctx.createBiquadFilter();
+      highShelfNode.type = 'highshelf';
+      highShelfNode.frequency.value = 4000;
+      highShelfNode.gain.value = 0;
+
       const gainNode = ctx.createGain();
       const clientConfig = clientsRef.current.find((c) => c.nodeId === nodeId);
       const db = clientConfig ? clientConfig.gainDb : 0;
-      gainNode.gain.value = Math.pow(10, db / 20);
+      const baseLinearGain =
+        db > 0 ? Math.pow(10, db / 20) : manualGainRef.current;
+      gainNode.gain.value = baseLinearGain;
 
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
@@ -798,21 +1028,26 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       const isSoloAllowed =
         !masterMutedRef.current &&
         (soloNodeIdRef.current === null || soloNodeIdRef.current === nodeId);
-      // Hubungkan gainNode -> speakerGain -> ctx.destination agar suara selalu keluar jernih baik di 0dB maupun +24dB
       speakerGain.gain.value = isSoloAllowed ? 1.0 : 0.0;
 
-      sourceNode.connect(gainNode);
-      gainNode.connect(analyser);
-      gainNode.connect(destNode);
-      gainNode.connect(speakerGain);
-      speakerGain.connect(ctx.destination);
+      // Simpan ke dalam `audioNodes.current` sesuai spesifikasi useRef
+      audioNodes.current = {
+        source: sourceNode,
+        compressor: compressorNode,
+        highShelf: highShelfNode,
+        gain: gainNode,
+        ctx,
+      };
 
       const entry: AudioPipelineEntry = {
         stream: remoteStream,
         processedStream: destNode.stream,
         sourceNode,
+        compressorNode,
+        highShelfNode,
         gainNode,
         analyser,
+        destNode,
         speakerGain,
         recorder: null,
         chunks: [],
@@ -821,6 +1056,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       };
 
       pipelinesRef.current.set(nodeId, entry);
+
+      // Panggil applyAudioMode dengan mode aktif saat ini (default: 'RAW')
+      applyAudioMode(audioModeRef.current);
 
       upsertConnectedClient(nodeId, {
         hasAudioStream: true,
@@ -846,6 +1084,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       }
     },
     [
+      applyAudioMode,
       getAudioContext,
       startNodeRecording,
       unlockAllAudioPlayback,
@@ -1958,6 +2197,40 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     []
   );
 
+  const handleManualGainSliderChange = useCallback(
+    (newLinearGain: number) => {
+      unlockAllAudioPlayback();
+      setManualGainValue(newLinearGain);
+      manualGainRef.current = newLinearGain;
+
+      // Pastikan slider Gain/Volume manual tersambung langsung ke `audioNodes.current.gain`
+      if (audioNodes.current.gain && audioNodes.current.ctx) {
+        audioNodes.current.gain.gain.setTargetAtTime(
+          newLinearGain,
+          audioNodes.current.ctx.currentTime,
+          0.03
+        );
+      } else if (audioNodes.current.gain) {
+        audioNodes.current.gain.gain.value = newLinearGain;
+      }
+
+      // Sinkronkan juga ke seluruh pipeline aktif
+      const ctx = audioCtxRef.current;
+      pipelinesRef.current.forEach((entry) => {
+        if (ctx) {
+          entry.gainNode.gain.setTargetAtTime(
+            newLinearGain,
+            ctx.currentTime,
+            0.03
+          );
+        } else {
+          entry.gainNode.gain.value = newLinearGain;
+        }
+      });
+    },
+    [unlockAllAudioPlayback]
+  );
+
   const handleCycleGain = (nodeId: string) => {
     unlockAllAudioPlayback();
     setClients((prev) =>
@@ -1966,6 +2239,15 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         const nextIdx = (GAIN_STEPS.indexOf(c.gainDb) + 1) % GAIN_STEPS.length;
         const nextGainDb = GAIN_STEPS[nextIdx];
         const remoteLinearGain = Number(Math.pow(10, nextGainDb / 20).toFixed(2));
+        setManualGainValue(remoteLinearGain);
+        manualGainRef.current = remoteLinearGain;
+        if (audioNodes.current.gain) {
+          audioNodes.current.gain.gain.value = remoteLinearGain;
+        }
+        const entry = pipelinesRef.current.get(nodeId);
+        if (entry) {
+          entry.gainNode.gain.value = remoteLinearGain;
+        }
         dispatchRemoteNodeCommand(nodeId, 'SET_GAIN', remoteLinearGain);
         setConnectionBanner(
           `REMOTE GAIN COMMAND SENT TO NODE (${nodeId}): +${nextGainDb}dB (${remoteLinearGain}x)`
@@ -2322,6 +2604,91 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               <span>WIPE ALL</span>
             </button>
           )}
+        </div>
+      </div>
+
+      {/* TACTICAL AUDIO MODE SWITCHER BAR (DYNAMIC WEB AUDIO API ROUTING) */}
+      <div className="border-b border-cyan-500/25 bg-[#030914] px-3 sm:px-5 py-2 flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[11px] text-cyan-300 font-semibold uppercase tracking-wider flex items-center gap-1.5">
+            <Volume2 className="w-3.5 h-3.5 text-cyan-400" />
+            <span>AUDIO MODE SWITCHER:</span>
+          </span>
+
+          <div className="flex flex-wrap items-center gap-1.5 bg-[#02060d] p-1 rounded border border-cyan-500/35">
+            <button
+              type="button"
+              onClick={() => {
+                unlockAllAudioPlayback();
+                applyAudioMode('RAW');
+              }}
+              className={`px-3 py-1 text-[11px] rounded transition-all cursor-pointer whitespace-nowrap ${
+                audioMode === 'RAW'
+                  ? 'bg-cyan-500/30 text-cyan-100 border border-cyan-400 font-bold shadow-[0_0_10px_rgba(0,255,255,0.3)]'
+                  : 'text-slate-400 hover:text-cyan-200 border border-transparent'
+              }`}
+              title="Bypass efek: Source -> Gain -> Destination (Suara asli mentah dari lingkungan)"
+            >
+              [RAW MODE]
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                unlockAllAudioPlayback();
+                applyAudioMode('CLEAR EQ');
+              }}
+              className={`px-3 py-1 text-[11px] rounded transition-all cursor-pointer whitespace-nowrap ${
+                audioMode === 'CLEAR EQ'
+                  ? 'bg-emerald-500/30 text-emerald-100 border border-emerald-400 font-bold shadow-[0_0_10px_rgba(16,185,129,0.35)]'
+                  : 'text-slate-400 hover:text-emerald-200 border border-transparent'
+              }`}
+              title="Jernih & Mencerahkan suara mendem: Compressor (Ratio 8, -30dB) -> HighShelf (+6dB @ 4000Hz) -> Gain"
+            >
+              [CLEAR EQ]
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                unlockAllAudioPlayback();
+                applyAudioMode('TACTICAL BOOST');
+              }}
+              className={`px-3 py-1 text-[11px] rounded transition-all cursor-pointer whitespace-nowrap ${
+                audioMode === 'TACTICAL BOOST'
+                  ? 'bg-amber-500/30 text-amber-100 border border-amber-400 font-bold shadow-[0_0_12px_rgba(245,158,11,0.4)]'
+                  : 'text-slate-400 hover:text-amber-200 border border-transparent'
+              }`}
+              title="Sensitivitas Ekstrem (Penyedot Bisikan Jarak Jauh): Compressor (Ratio 20, -50dB) -> HighShelf (+8dB @ 4000Hz) -> Gain"
+            >
+              [TACTICAL BOOST]
+            </button>
+          </div>
+
+          <span className="hidden md:inline-block text-[10px] text-slate-400 pl-1">
+            {audioMode === 'RAW' &&
+              'RUTE: SOURCE → GAIN → DESTINATION (SUARA ASLI MENTAH)'}
+            {audioMode === 'CLEAR EQ' &&
+              'RUTE: SOURCE → COMP (8:1, -30dB) → HIGHSHELF (+6dB @ 4kHz) → GAIN'}
+            {audioMode === 'TACTICAL BOOST' &&
+              'RUTE: SOURCE → COMP EKSTREM (20:1, -50dB) → HIGHSHELF (+8dB @ 4kHz) → GAIN'}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2.5 bg-[#061224] border border-cyan-500/35 px-3 py-1 rounded text-[11px]">
+          <span className="text-cyan-300 font-semibold whitespace-nowrap">
+            MASTER GAIN: {manualGainValue.toFixed(1)}x
+          </span>
+          <input
+            type="range"
+            min={0}
+            max={8}
+            step={0.1}
+            value={manualGainValue}
+            onChange={(e) => handleManualGainSliderChange(Number(e.target.value))}
+            className="w-24 sm:w-28 accent-cyan-400 cursor-pointer"
+            title="Kontrol Gain / Volume Manual (Tersambung ke audioNodes.current.gain)"
+          />
         </div>
       </div>
 
